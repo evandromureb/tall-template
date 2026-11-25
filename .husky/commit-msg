@@ -1,0 +1,84 @@
+#!/usr/bin/env sh
+#
+# Hook commit-msg
+#
+# 1. Recusa mensagens que mencionem qualquer ferramenta ou termo de IA.
+# 2. Garante o padrão "<nome-da-branch>: <texto>", adicionando o prefixo quando faltar.
+
+commit_message_file="$1"
+
+if [ -z "$commit_message_file" ] || [ ! -f "$commit_message_file" ]; then
+	exit 0
+fi
+
+# Conteúdo real da mensagem: sem linhas de comentário e sem o diff do "git commit -v".
+message_content=$(awk '
+	/^# -+ >8 -+$/ { exit }
+	/^#/ { next }
+	{ print }
+' "$commit_message_file")
+
+# Mensagem vazia: o próprio Git aborta o commit.
+if [ -z "$(printf '%s' "$message_content" | tr -d '[:space:]')" ]; then
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Bloqueio de menções a IA
+# ---------------------------------------------------------------------------
+
+# Termos procurados como palavra inteira, sem diferenciar maiúsculas/minúsculas.
+ai_terms='claude|anthropic|chatgpt|openai|gpt|gpt-?[0-9][a-z0-9.-]*|copilot|gemini|bard|llama|mistral|mixtral|cohere|perplexity|deepseek|grok|qwen|codex|codeium|windsurf|tabnine|codewhisperer|sourcegraph cody|devin ai|aider|cline|lovable|replit agent|amazon q|cursor ai|cursor\.sh|chatbot|llm|llms|machine learning|intelig[eê]ncia artificial|artificial intelligence|ai-generated|ai-assisted|generated (by|with) (ai|an ai)|gerado (por|com) (ia|uma ia)|co-authored-by: *(claude|copilot|chatgpt|gpt|gemini|cursor|aider)'
+
+# Siglas verificadas respeitando maiúsculas, para não confundir com "eu ia".
+ai_acronyms='AI|IA|A\.I\.|I\.A\.'
+
+ai_term_found=$(printf '%s\n' "$message_content" | grep -oiwE "$ai_terms" | head -n 1)
+
+if [ -z "$ai_term_found" ]; then
+	ai_term_found=$(printf '%s\n' "$message_content" | grep -owE "$ai_acronyms" | head -n 1)
+fi
+
+if [ -z "$ai_term_found" ] && printf '%s' "$message_content" | grep -q '🤖'; then
+	ai_term_found='🤖'
+fi
+
+if [ -n "$ai_term_found" ]; then
+	echo "✖ Commit recusado: a mensagem menciona IA (\"$ai_term_found\")." >&2
+	echo "  Remova qualquer referência a ferramentas ou uso de IA e tente novamente." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Prefixo obrigatório "<branch>: "
+# ---------------------------------------------------------------------------
+
+branch_name=$(git symbolic-ref --quiet --short HEAD 2>/dev/null)
+
+# Sem branch (rebase, HEAD destacado): não há como montar o prefixo.
+if [ -z "$branch_name" ]; then
+	exit 0
+fi
+
+normalized_message_file="${commit_message_file}.normalized"
+
+awk -v branch="$branch_name" '
+	BEGIN { prefix = branch ": "; done = 0 }
+	done == 0 && /^#/ { print; next }
+	done == 0 && /^[[:space:]]*$/ { print; next }
+	done == 0 {
+		done = 1
+		line = $0
+		# fixup!/squash!/amend! precisam continuar no início para o autosquash.
+		if (line ~ /^(fixup|squash|amend)! /) { print line; next }
+		# Já começa com o nome da branch: remove separadores soltos e normaliza.
+		if (index(line, branch) == 1) {
+			line = substr(line, length(branch) + 1)
+			sub(/^[[:space:]]*[-:][[:space:]]*/, "", line)
+			sub(/^[[:space:]]+/, "", line)
+		}
+		print prefix line
+		next
+	}
+	{ print }
+' "$commit_message_file" > "$normalized_message_file" && mv "$normalized_message_file" "$commit_message_file"
